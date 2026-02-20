@@ -1,0 +1,5 @@
+streamlit>=1.35.0
+pandas>=2.0.0
+meraki>=1.46.0
+rich>=13.0.0
+requests>=2.31.0
