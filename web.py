@@ -170,7 +170,7 @@ def run_web():
                 st.markdown("### MX Local DNS Manager")
                 st.caption("Centralized management for Local DNS resolution on MX appliances.")
                 st.markdown("**Author:** SandroN")
-                st.markdown("[GitHub Project Repository](#)")
+                st.markdown("[GitHub Project Repository](https://github.com/SandroNardi/meraki_MX_local_DNS_managment)")
                 
                 st.divider()
                 if st.button("⚙️ System Configuration", width='stretch'):
