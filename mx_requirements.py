@@ -55,16 +55,23 @@ def format_dns_nameservers(dns_nameservers: str | None) -> str:
     return dns_nameservers
 
 
+def _proxy_subnet_detail(subnets: list[dict]) -> str:
+    enabled = sum(1 for subnet in subnets if subnet.get("proxy_upstream_dns"))
+    total = len(subnets)
+    if total == 0:
+        return "No subnets discovered"
+    return f"{enabled} of {total} subnet(s) use Proxy to Upstream DNS"
+
+
 def build_eligibility_checks(
     *,
     firmware: str | None,
     deployment_mode: str | None,
     is_template_bound: bool,
-    subnets: list[dict],
-    profile_assigned: bool,
-    dns_record_count: int,
+    dns_record_count: int = 0,
 ) -> list[dict]:
-    checks = [
+    """Blocking requirements that must pass before a Local DNS profile can be assigned."""
+    return [
         {
             "name": "MX firmware 19.1+",
             "passed": firmware_meets_minimum(firmware),
@@ -81,38 +88,35 @@ def build_eligibility_checks(
             "detail": "Bound to config template" if is_template_bound else "Standalone network",
         },
         {
-            "name": "Local DNS profile assigned",
-            "passed": profile_assigned,
-            "detail": "Profile linked to network" if profile_assigned else "No profile assignment",
-        },
-        {
-            "name": "Proxy to Upstream DNS on at least one subnet",
-            "passed": any(subnet.get("proxy_upstream_dns") for subnet in subnets),
-            "detail": _proxy_subnet_detail(subnets),
-        },
-        {
             "name": f"DNS record limit (max {MAX_LOCAL_DNS_RECORDS_PER_MX} per MX)",
             "passed": dns_record_count <= MAX_LOCAL_DNS_RECORDS_PER_MX,
-            "detail": f"{dns_record_count} record(s) on assigned profile",
+            "detail": f"{dns_record_count} record(s) on profile to assign",
         },
     ]
-    return checks
 
 
-def _proxy_subnet_detail(subnets: list[dict]) -> str:
-    enabled = sum(1 for subnet in subnets if subnet.get("proxy_upstream_dns"))
-    total = len(subnets)
-    if total == 0:
-        return "No subnets discovered"
-    return f"{enabled} of {total} subnet(s) use Proxy to Upstream DNS"
+def build_eligibility_warnings(*, subnets: list[dict]) -> list[dict]:
+    """Non-blocking warnings — assignment is allowed but Local DNS may not take effect."""
+    proxy_enabled = any(subnet.get("proxy_upstream_dns") for subnet in subnets)
+    return [
+        {
+            "name": "Proxy to Upstream DNS on at least one subnet",
+            "passed": proxy_enabled,
+            "detail": _proxy_subnet_detail(subnets),
+        }
+    ]
 
 
-def eligibility_summary(checks: list[dict]) -> str:
-    if all(check["passed"] for check in checks):
-        return "Ready"
-    failed = [check["name"] for check in checks if not check["passed"]]
-    return f"Not ready ({len(failed)} issue(s))"
+def eligibility_summary(checks: list[dict], warnings: list[dict] | None = None) -> str:
+    if not all(check["passed"] for check in checks):
+        failed = [check["name"] for check in checks if not check["passed"]]
+        return f"Not ready ({len(failed)} issue(s))"
+
+    warnings = warnings or []
+    if any(not warning["passed"] for warning in warnings):
+        return "Ready (with warnings)"
+    return "Ready for assignment"
 
 
-def is_local_dns_functional(checks: list[dict]) -> bool:
+def is_eligible_for_profile_assignment(checks: list[dict]) -> bool:
     return all(check["passed"] for check in checks)

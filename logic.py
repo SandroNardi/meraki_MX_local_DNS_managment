@@ -6,10 +6,11 @@ from core.logger import logger
 from mx_requirements import (
     MAX_LOCAL_DNS_RECORDS_PER_MX,
     build_eligibility_checks,
+    build_eligibility_warnings,
     eligibility_summary,
     format_dns_nameservers,
     format_firmware_version,
-    is_local_dns_functional,
+    is_eligible_for_profile_assignment,
     is_proxy_upstream_dns,
 )
 from validators import validate_hostname, validate_ip_address, validate_profile_name
@@ -234,6 +235,7 @@ class ProjectLogic:
         profile_name,
         profile_records,
         assignment_id,
+        record_count_for_checks=None,
     ):
         network_id = network.get("id")
         primary_appliance = appliances[0] if appliances else {}
@@ -242,17 +244,20 @@ class ProjectLogic:
         subnets = self.fetch_network_subnets_live(network_id)
         is_template_bound = bool(network.get("isBoundToConfigTemplate"))
         deployment_mode = settings.get("deploymentMode")
-        dns_record_count = len(profile_records)
+        dns_record_count = (
+            record_count_for_checks
+            if record_count_for_checks is not None
+            else len(profile_records)
+        )
         profile_assigned = profile_id is not None
 
         checks = build_eligibility_checks(
             firmware=firmware,
             deployment_mode=deployment_mode,
             is_template_bound=is_template_bound,
-            subnets=subnets,
-            profile_assigned=profile_assigned,
             dns_record_count=dns_record_count,
         )
+        warnings = build_eligibility_warnings(subnets=subnets)
         proxy_subnet_count = sum(
             1 for subnet in subnets if subnet.get("proxy_upstream_dns")
         )
@@ -275,8 +280,12 @@ class ProjectLogic:
             "proxy_subnet_count": proxy_subnet_count,
             "total_subnet_count": len(subnets),
             "checks": checks,
-            "eligibility": eligibility_summary(checks),
-            "local_dns_functional": is_local_dns_functional(checks),
+            "warnings": warnings,
+            "eligibility": eligibility_summary(checks, warnings),
+            "eligible_for_assignment": is_eligible_for_profile_assignment(checks),
+            "local_dns_effective": all(
+                warning["passed"] for warning in warnings
+            ),
             "record_limit_ok": dns_record_count <= MAX_LOCAL_DNS_RECORDS_PER_MX,
         }
 
@@ -334,7 +343,7 @@ class ProjectLogic:
 
             if profile_id:
                 configured += 1
-            if row["local_dns_functional"]:
+            if row["eligible_for_assignment"]:
                 functional += 1
             total_proxy_subnets += row["proxy_subnet_count"]
 
@@ -344,27 +353,39 @@ class ProjectLogic:
                 "total_mx": total,
                 "configured_mx": configured,
                 "unconfigured_mx": total - configured,
-                "functional_mx": functional,
+                "eligible_mx": functional,
                 "total_profiles": len(profiles),
                 "total_records": len(records),
                 "total_proxy_subnets": total_proxy_subnets,
             },
         }
 
-    def validate_networks_for_local_dns(self, org_id, network_ids):
-        """Return per-network eligibility warnings before assignment/import."""
+    def validate_networks_for_local_dns(
+        self, org_id, network_ids, profile_id=None, profile_record_count=None
+    ):
+        """Return blocking failures and non-blocking warnings for profile assignment."""
         if not network_ids:
-            return []
+            return {"failures": [], "warnings": []}
+
+        if profile_record_count is None and profile_id:
+            profile_record_count = len(
+                self.list_dns_records(org_id, profile_ids=[profile_id])
+            )
+        elif profile_record_count is None:
+            profile_record_count = 0
+
+        profile_records = []
 
         mx_networks = self.fetch_mx_networks_live(org_id)
         network_lookup = {network["id"]: network for network in mx_networks}
         appliances_by_network = self.fetch_organization_appliances_live(org_id)
-        warnings = []
+        failures = []
+        assignment_warnings = []
 
         for network_id in network_ids:
             network = network_lookup.get(network_id)
             if not network:
-                warnings.append(
+                failures.append(
                     {
                         "network_id": network_id,
                         "network_name": network_id,
@@ -378,24 +399,37 @@ class ProjectLogic:
                 appliances_by_network.get(network_id, []),
                 None,
                 "",
-                [],
+                profile_records,
                 "",
+                record_count_for_checks=profile_record_count,
             )
             issues = [
                 f"{check['name']}: {check['detail']}"
                 for check in row["checks"]
                 if not check["passed"]
-                and check["name"] != "Local DNS profile assigned"
             ]
             if issues:
-                warnings.append(
+                failures.append(
                     {
                         "network_id": network_id,
                         "network_name": row["network_name"],
                         "issues": issues,
                     }
                 )
-        return warnings
+            warn_issues = [
+                f"{warning['name']}: {warning['detail']}"
+                for warning in row["warnings"]
+                if not warning["passed"]
+            ]
+            if warn_issues:
+                assignment_warnings.append(
+                    {
+                        "network_id": network_id,
+                        "network_name": row["network_name"],
+                        "issues": warn_issues,
+                    }
+                )
+        return {"failures": failures, "warnings": assignment_warnings}
 
     def list_profiles(self, org_id):
         _increment_counter("appliance.getOrganizationApplianceDnsLocalProfiles")
@@ -502,6 +536,16 @@ class ProjectLogic:
             return {"error": "Select at least one MX network."}
         if not profile_id:
             return {"error": "Select a profile."}
+
+        failures = self.validate_networks_for_local_dns(
+            org_id, network_ids, profile_id=profile_id
+        )["failures"]
+        if failures:
+            blocked = "; ".join(
+                f"{item['network_name']}: {', '.join(item['issues'])}"
+                for item in failures
+            )
+            return {"error": f"Profile assignment blocked — {blocked}"}
 
         _increment_counter("appliance.bulkOrganizationApplianceDnsLocalProfilesAssignmentsCreate")
         try:

@@ -252,29 +252,36 @@ def execute_confirmed_action(logic, org_id, req, progress_callback=None):
     return {"error": f"Unknown action: {action}"}
 
 
-def build_assign_confirmation_message(logic, org_id, network_ids):
-    warnings = logic.validate_networks_for_local_dns(org_id, network_ids)
-    message = f"Assign profile to {len(network_ids)} MX network(s)?"
+def build_assign_confirmation_message(network_count: int, warnings=None) -> str:
+    message = f"Assign profile to {network_count} MX network(s)?"
     if not warnings:
         return message
-
-    lines = [message, "", "Eligibility warnings:"]
+    lines = [message, "", "Warnings (assignment allowed, Local DNS may not work):"]
     for warning in warnings:
         issue_text = "; ".join(warning["issues"])
         lines.append(f"- {warning['network_name']}: {issue_text}")
-    lines.append("")
-    lines.append(
-        "The API call may succeed, but Local DNS will not work until these issues are resolved."
-    )
     return "\n".join(lines)
 
 
-def build_import_confirmation_message(logic, org_id, network_ids):
-    if not network_ids:
-        return "Import this JSON configuration?"
-    return build_assign_confirmation_message(logic, org_id, network_ids).replace(
-        "Assign profile to", "Import configuration and assign profile to", 1
-    )
+def build_import_confirmation_message(network_count: int, warnings=None) -> str:
+    if network_count == 0:
+        base = "Import this JSON configuration?"
+    else:
+        base = f"Import configuration and assign profile to {network_count} MX network(s)?"
+    if not warnings:
+        return base
+    lines = [base, "", "Warnings (assignment allowed, Local DNS may not work):"]
+    for warning in warnings:
+        issue_text = "; ".join(warning["issues"])
+        lines.append(f"- {warning['network_name']}: {issue_text}")
+    return "\n".join(lines)
+
+
+def show_assignment_blockers(failures):
+    st.error("Cannot assign profile — these networks do not meet Local DNS prerequisites:")
+    for failure in failures:
+        issue_text = "; ".join(failure["issues"])
+        st.markdown(f"- **{failure['network_name']}**: {issue_text}")
 
 
 def style_subnet_dataframe(subnets_df: pd.DataFrame):
@@ -284,15 +291,10 @@ def style_subnet_dataframe(subnets_df: pd.DataFrame):
         return [""] * len(row)
 
     return subnets_df.style.apply(_highlight, axis=1)
-    def _highlight(row):
-        if row.get("Uses Local DNS") == "Yes":
-            return ["background-color: #d4edda; color: #155724"] * len(row)
-        return [""] * len(row)
-
-    return subnets_df.style.apply(_highlight, axis=1)
 
 
-def render_eligibility_checks(checks):
+def render_eligibility_checks(checks, warnings=None):
+    st.markdown("**Assignment requirements**")
     check_df = pd.DataFrame(
         [
             {
@@ -304,6 +306,21 @@ def render_eligibility_checks(checks):
         ]
     )
     st.dataframe(check_df, width="stretch", hide_index=True)
+
+    warnings = warnings or []
+    if warnings:
+        st.markdown("**Warnings**")
+        warning_df = pd.DataFrame(
+            [
+                {
+                    "Warning": warning["name"],
+                    "Status": "OK" if warning["passed"] else "Attention",
+                    "Detail": warning["detail"],
+                }
+                for warning in warnings
+            ]
+        )
+        st.dataframe(warning_df, width="stretch", hide_index=True)
 
 
 def render_overview(logic, org_id, progress_callback=None):
@@ -319,7 +336,7 @@ def render_overview(logic, org_id, progress_callback=None):
     metric_cols = st.columns(6)
     metric_cols[0].metric("MX Networks", summary["total_mx"])
     metric_cols[1].metric("Profile Assigned", summary["configured_mx"])
-    metric_cols[2].metric("Local DNS Ready", summary["functional_mx"])
+    metric_cols[2].metric("Ready for Assignment", summary["eligible_mx"])
     metric_cols[3].metric("Subnets Using Local DNS", summary["total_proxy_subnets"])
     metric_cols[4].metric("Profiles", summary["total_profiles"])
     metric_cols[5].metric("Total DNS Records", summary["total_records"])
@@ -327,14 +344,15 @@ def render_overview(logic, org_id, progress_callback=None):
     with st.expander("Local DNS prerequisites", expanded=False):
         st.markdown(
             """
-            Local DNS only works when **all** of the following are true:
+            Local DNS requires the following **before** a profile can be assigned:
 
             - MX firmware **19.1+**
             - **NAT/Routed** deployment mode (not passthrough)
             - **Non-template** MX network
-            - Local DNS **profile assigned** to the network
-            - **Proxy to Upstream DNS** enabled on at least one subnet/VLAN
-            - No more than **1024** DNS records on the assigned profile (per MX)
+            - No more than **1024** DNS records on the profile being assigned
+
+            **Proxy to Upstream DNS** on a subnet is recommended but not required.
+            Without it, a profile can still be assigned but Local DNS will not take effect.
             """
         )
 
@@ -381,11 +399,16 @@ def render_overview(logic, org_id, progress_callback=None):
         selected_row = rows[selected_rows[0]]
         st.markdown(f"#### {selected_row['network_name']}")
 
-        render_eligibility_checks(selected_row["checks"])
-        if not selected_row["local_dns_functional"]:
+        render_eligibility_checks(selected_row["checks"], selected_row.get("warnings"))
+        if not selected_row["eligible_for_assignment"]:
             st.warning(
-                "This MX network does not meet all Local DNS prerequisites. "
-                "Configuration may not take effect until the failed checks are resolved."
+                "This MX network does not meet all assignment requirements. "
+                "A Local DNS profile cannot be assigned until the failed checks are resolved."
+            )
+        elif not selected_row.get("local_dns_effective", True):
+            st.warning(
+                "A profile can be assigned, but Local DNS will not work until "
+                "**Proxy to Upstream DNS** is enabled on at least one subnet."
             )
         if not selected_row["record_limit_ok"]:
             st.error(
@@ -724,16 +747,23 @@ def render_assignments(logic, org_id, progress_callback):
         if not selected_network_ids:
             st.toast("Select at least one MX network.", icon="⚠️")
         else:
-            request_confirmation(
-                "bulk_assign",
-                build_assign_confirmation_message(
-                    logic, org_id, selected_network_ids
-                ),
-                {
-                    "network_ids": selected_network_ids,
-                    "profile_id": profile_options[selected_profile],
-                },
+            profile_id = profile_options[selected_profile]
+            validation = logic.validate_networks_for_local_dns(
+                org_id, selected_network_ids, profile_id=profile_id
             )
+            if validation["failures"]:
+                show_assignment_blockers(validation["failures"])
+            else:
+                request_confirmation(
+                    "bulk_assign",
+                    build_assign_confirmation_message(
+                        len(selected_network_ids), validation["warnings"]
+                    ),
+                    {
+                        "network_ids": selected_network_ids,
+                        "profile_id": profile_id,
+                    },
+                )
 
     st.divider()
     st.markdown("#### JSON import / export")
@@ -785,17 +815,34 @@ def render_assignments(logic, org_id, progress_callback):
             else:
                 st.json(config)
                 if st.button("Import configuration", type="primary"):
-                    request_confirmation(
-                        "import_config",
-                        build_import_confirmation_message(
-                            logic, org_id, import_networks
-                        ),
-                        {
-                            "config": config,
-                            "network_ids": import_networks,
-                            "create_missing": create_missing,
-                        },
-                    )
+                    profile_data = config.get("profile") or {}
+                    profile_id = profile_data.get("profile_id")
+                    record_count = len(profile_data.get("records") or [])
+                    failures = []
+                    assignment_warnings = []
+                    if import_networks:
+                        validation = logic.validate_networks_for_local_dns(
+                            org_id,
+                            import_networks,
+                            profile_id=profile_id,
+                            profile_record_count=record_count if not profile_id else None,
+                        )
+                        failures = validation["failures"]
+                        assignment_warnings = validation["warnings"]
+                    if failures:
+                        show_assignment_blockers(failures)
+                    else:
+                        request_confirmation(
+                            "import_config",
+                            build_import_confirmation_message(
+                                len(import_networks), assignment_warnings
+                            ),
+                            {
+                                "config": config,
+                                "network_ids": import_networks,
+                                "create_missing": create_missing,
+                            },
+                        )
 
 
 def run_web():
