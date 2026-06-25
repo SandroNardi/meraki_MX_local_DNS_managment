@@ -1,15 +1,53 @@
-import streamlit as st
-import pandas as pd
-import time
+import json
 import os
-import html
-from core.logger import logger, ENABLE_FILE_LOGGING, LOG_FILENAME
-from logic import ProjectLogic, CACHE_CONFIG
+import time
 
-# --- UTILITY FUNCTIONS ---
+import pandas as pd
+import streamlit as st
+
+from core.logger import ENABLE_FILE_LOGGING, LOG_FILENAME, logger
+from logic import (
+    CACHE_CONFIG,
+    ProjectLogic,
+    filter_mx_networks,
+    format_network_tags,
+    get_unique_network_tags,
+)
+from mx_requirements import MAX_LOCAL_DNS_RECORDS_PER_MX
+from validators import validate_hostname, validate_ip_address, validate_profile_name
+
+BRANDING_CSS = """
+<style>
+    :root {
+        --primary-accent: #144a90;
+        --top-bar-bg: #07172B;
+        --white: #FFFFFF;
+        --gradient: linear-gradient(to right, #007bff, #6610f2, #e83e8c, #fd7e14);
+    }
+    [data-testid="stIconMaterial"] { color: var(--primary-accent) !important; }
+    [data-testid="stBaseButton-header"] { color: var(--white) !important; }
+    [data-testid="stMainMenu"] svg { fill: var(--white) !important; }
+    .stAppDeployButton { display: none !important; }
+    header[data-testid="stHeader"] { background-color: transparent; }
+    .top-gradient-bar {
+        position: fixed; top: 0; left: 0; width: 100%; height: 4px;
+        background-image: var(--gradient); z-index: 100001;
+    }
+    .top-bar {
+        position: fixed; top: 4px; left: 0; width: 100%; height: 56px;
+        background-color: var(--top-bar-bg); z-index: 100000;
+        display: flex; align-items: center; padding-left: 60px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+    .top-bar-text { color: var(--white); font-weight: 600; font-size: 1.1em; }
+    .block-container { padding-top: 6rem; }
+</style>
+<div class="top-gradient-bar"></div>
+<div class="top-bar"><div class="top-bar-text">MX LOCAL DNS MANAGER</div></div>
+"""
+
 
 def get_file_content(file_path, last_n_lines=None):
-    """Safely reads local files for UI modals."""
     try:
         if not os.path.exists(file_path):
             return f"File '{file_path}' not found."
@@ -17,379 +55,863 @@ def get_file_content(file_path, last_n_lines=None):
             if last_n_lines:
                 return f.readlines()[-last_n_lines:]
             return f.read()
-    except Exception as e:
-        return f"Error reading file: {e}"
+    except Exception as exc:
+        return f"Error reading file: {exc}"
 
-# --- MODAL DIALOGS ---
+
+def inject_branding():
+    st.markdown(BRANDING_CSS, unsafe_allow_html=True)
+
+
+def request_confirmation(action, message, payload):
+    st.session_state["confirm_request"] = {
+        "action": action,
+        "message": message,
+        "payload": payload,
+    }
+
+
+@st.dialog("Confirm Action", width="small")
+def show_confirm_dialog():
+    req = st.session_state.get("confirm_request", {})
+    message = req.get("message", "Are you sure you want to continue?")
+    st.warning(message)
+    col_confirm, col_cancel = st.columns(2)
+    with col_confirm:
+        if st.button("Confirm", type="primary", width="stretch"):
+            st.session_state["confirm_approved"] = req
+            st.session_state.pop("confirm_request", None)
+            st.rerun()
+    with col_cancel:
+        if st.button("Cancel", width="stretch"):
+            st.session_state.pop("confirm_request", None)
+            st.rerun()
+
 
 @st.dialog("System Configuration", width="large")
 def show_config_modal():
-    """Display system configuration including API key status, logging settings, and cache configuration."""
     logger.info("UI: Opening System Configuration modal.")
-    st.markdown("### 🛠️ Environment & Logging")
-    api_key_status = "✅ Set" if os.getenv("MK_CSM_KEY") else "❌ Missing"
+    st.markdown("### Environment & Logging")
+    api_key_status = "Set" if os.getenv("MK_CSM_KEY") else "Missing"
     st.write(f"**API Key (MK_CSM_KEY):** {api_key_status}")
-    st.write(f"**Log Level:** `INFO` (Rich Markup Enabled)")
+    st.write("**Log Level:** `INFO`")
     st.write(f"**File Logging:** `{'Enabled' if ENABLE_FILE_LOGGING else 'Disabled'}`")
     if ENABLE_FILE_LOGGING:
         st.write(f"**Log Filename:** `{LOG_FILENAME}`")
-    
     st.divider()
-    st.markdown("### ⏱️ Caching Timers (Seconds)")
+    st.markdown("### Caching Timers (Seconds)")
     st.json(CACHE_CONFIG)
+    st.caption("Overview and DNS inspection always use live API data.")
+
 
 @st.dialog("Application Logs", width="large")
 def show_log_modal():
-    """Display application logs in a terminal-style interface with syntax highlighting."""
     logger.info("UI: Opening Application Logs modal.")
     st.markdown(f"**Reading from:** `{LOG_FILENAME}`")
     lines = get_file_content(LOG_FILENAME, last_n_lines=2000)
-    
     if isinstance(lines, list):
         full_content = "".join(lines)
         st.download_button(
-            label="📥 Download Log File",
+            label="Download Log File",
             data=full_content,
             file_name="application_log.txt",
             mime="text/plain",
         )
-        
-        # Terminal-style log renderer with color-coded log levels
-        log_html = ["""
-        <style>
-            .terminal-window {
-                background-color: #0e1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace;
-                font-size: 12px; padding: 15px; border-radius: 8px; border: 1px solid #30363d;
-                height: 500px; overflow-y: auto; white-space: pre-wrap; line-height: 1.4;
-            }
-            .log-line { margin-bottom: 2px; }
-            .log-info { color: #3fb950; }
-            .log-warn { color: #d29922; }
-            .log-error { color: #f85149; }
-            .log-meta { color: #8b949e; }
-        </style>
-        <div class="terminal-window">
-        """]
-
-        for line in lines:
-            safe_line = html.escape(line.strip())
-            css_class = "log-line"
-            if "INFO" in safe_line: css_class += " log-info"
-            elif "WARNING" in safe_line: css_class += " log-warn"
-            elif "ERROR" in safe_line: css_class += " log-error"
-            
-            parts = safe_line.split(" - ", 1)
-            if len(parts) > 1:
-                log_html.append(f'<div class="{css_class}"><span class="log-meta">{parts[0]} - </span>{parts[1]}</div>')
-            else:
-                log_html.append(f'<div class="{css_class}">{safe_line}</div>')
-
-        log_html.append("</div>")
-        st.markdown("".join(log_html), unsafe_allow_html=True)
+        st.code(full_content, language="text")
     else:
         st.error(lines)
 
+
 @st.dialog("License", width="large")
 def show_license_modal():
-    """Display the application license file."""
     st.markdown("### Open Source License")
     content = get_file_content("LICENSE")
     st.code(content, language="text")
 
+
 @st.dialog("ReadMe", width="large")
 def show_readme_modal():
-    """Display the README.md file content."""
     content = get_file_content("README.md")
-    st.markdown(content)
+    st.code(content, language="text")
 
-# --- MAIN APPLICATION ---
+
+def render_sidebar_about():
+    with st.expander("About", expanded=False):
+        st.markdown("### MX Local DNS Manager")
+        st.caption("Centralized management for Local DNS resolution on MX appliances.")
+        st.markdown("**Author:** SandroN")
+        st.markdown(
+            "[GitHub Project Repository](https://github.com/SandroNardi/meraki_MX_local_DNS_managment)"
+        )
+        st.divider()
+        if st.button("System Configuration", width="stretch"):
+            show_config_modal()
+        if ENABLE_FILE_LOGGING and st.button("Application Logs", width="stretch"):
+            show_log_modal()
+        col_license, col_readme = st.columns(2)
+        with col_license:
+            if st.button("License", width="stretch"):
+                show_license_modal()
+        with col_readme:
+            if st.button("ReadMe", width="stretch"):
+                show_readme_modal()
+
+
+def network_tag_selector(mx_networks, key_prefix):
+    all_tags = get_unique_network_tags(mx_networks)
+    selected_tags = st.multiselect(
+        "Filter by network tag(s)",
+        options=all_tags,
+        key=f"{key_prefix}_tags",
+    )
+    tag_match = st.radio(
+        "Tag match",
+        options=["Any tag", "All tags"],
+        horizontal=True,
+        key=f"{key_prefix}_tag_match",
+    )
+    name_search = st.text_input(
+        "Search network name",
+        key=f"{key_prefix}_name_search",
+        placeholder="Optional name filter",
+    )
+    tag_filter_type = "withAllTags" if tag_match == "All tags" else "withAnyTags"
+    filtered = filter_mx_networks(
+        mx_networks,
+        tag_filter=selected_tags or None,
+        tag_filter_type=tag_filter_type,
+        name_search=name_search,
+    )
+    return filtered
+
+
+def network_multiselect(filtered_networks, key_prefix):
+    options = {
+        f"{network['name']} ({network['id']})": network["id"]
+        for network in filtered_networks
+    }
+    selected_labels = st.multiselect(
+        "Select MX network(s)",
+        options=list(options.keys()),
+        key=f"{key_prefix}_networks",
+    )
+    return [options[label] for label in selected_labels]
+
+
+def execute_confirmed_action(logic, org_id, req, progress_callback=None):
+    action = req.get("action")
+    payload = req.get("payload", {})
+
+    if action == "bulk_delete_profiles":
+        profile_ids = payload.get("profile_ids", [])
+        results = {"deleted": 0, "errors": []}
+        total = len(profile_ids)
+        for index, profile_id in enumerate(profile_ids, start=1):
+            if progress_callback:
+                progress_callback(f"Deleting profile {index}/{total}", index, total)
+            res = logic.delete_profile(org_id, profile_id)
+            if res and "error" in res:
+                results["errors"].append({"profile_id": profile_id, "error": res["error"]})
+            else:
+                results["deleted"] += 1
+        return results
+    if action == "delete_record":
+        return logic.delete_dns_record(org_id, payload["record_id"])
+    if action == "bulk_delete_records":
+        record_ids = payload.get("record_ids", [])
+        total = len(record_ids)
+        results = {"deleted": 0, "errors": []}
+        for index, record_id in enumerate(record_ids, start=1):
+            if progress_callback:
+                progress_callback(f"Deleting record {index}/{total}", index, total)
+            res = logic.delete_dns_record(org_id, record_id)
+            if res and "error" in res:
+                results["errors"].append({"record_id": record_id, "error": res["error"]})
+            else:
+                results["deleted"] += 1
+        return results
+    if action == "remove_assignment":
+        return logic.remove_assignment(org_id, payload["assignment_id"])
+    if action == "bulk_remove_assignments":
+        return logic.bulk_remove_assignments(org_id, payload.get("assignment_ids", []))
+    if action == "bulk_assign":
+        network_ids = payload.get("network_ids", [])
+        total = len(network_ids)
+        if progress_callback and total > 1:
+            progress_callback("Assigning profile to selected networks", 1, 1)
+        return logic.bulk_assign_profile(
+            org_id, network_ids, payload.get("profile_id")
+        )
+    if action == "import_config":
+        return logic.import_profile_config(
+            org_id,
+            payload.get("config"),
+            network_ids=payload.get("network_ids"),
+            create_missing=payload.get("create_missing", True),
+        )
+    return {"error": f"Unknown action: {action}"}
+
+
+def build_assign_confirmation_message(logic, org_id, network_ids):
+    warnings = logic.validate_networks_for_local_dns(org_id, network_ids)
+    message = f"Assign profile to {len(network_ids)} MX network(s)?"
+    if not warnings:
+        return message
+
+    lines = [message, "", "Eligibility warnings:"]
+    for warning in warnings:
+        issue_text = "; ".join(warning["issues"])
+        lines.append(f"- {warning['network_name']}: {issue_text}")
+    lines.append("")
+    lines.append(
+        "The API call may succeed, but Local DNS will not work until these issues are resolved."
+    )
+    return "\n".join(lines)
+
+
+def build_import_confirmation_message(logic, org_id, network_ids):
+    if not network_ids:
+        return "Import this JSON configuration?"
+    return build_assign_confirmation_message(logic, org_id, network_ids).replace(
+        "Assign profile to", "Import configuration and assign profile to", 1
+    )
+
+
+def style_subnet_dataframe(subnets_df: pd.DataFrame):
+    def _highlight(row):
+        if row.get("Uses Local DNS") == "Yes":
+            return ["background-color: #d4edda; color: #155724"] * len(row)
+        return [""] * len(row)
+
+    return subnets_df.style.apply(_highlight, axis=1)
+    def _highlight(row):
+        if row.get("Uses Local DNS") == "Yes":
+            return ["background-color: #d4edda; color: #155724"] * len(row)
+        return [""] * len(row)
+
+    return subnets_df.style.apply(_highlight, axis=1)
+
+
+def render_eligibility_checks(checks):
+    check_df = pd.DataFrame(
+        [
+            {
+                "Requirement": check["name"],
+                "Status": "Pass" if check["passed"] else "Fail",
+                "Detail": check["detail"],
+            }
+            for check in checks
+        ]
+    )
+    st.dataframe(check_df, width="stretch", hide_index=True)
+
+
+def render_overview(logic, org_id, progress_callback=None):
+    st.subheader("MX Local DNS Overview")
+    st.caption(
+        "Live data — eligibility checks, subnet DNS proxy settings, and DNS records per MX."
+    )
+
+    with st.spinner("Loading live MX, subnet, and DNS state..."):
+        overview = logic.build_mx_overview(org_id, progress_callback=progress_callback)
+
+    summary = overview["summary"]
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("MX Networks", summary["total_mx"])
+    metric_cols[1].metric("Profile Assigned", summary["configured_mx"])
+    metric_cols[2].metric("Local DNS Ready", summary["functional_mx"])
+    metric_cols[3].metric("Subnets Using Local DNS", summary["total_proxy_subnets"])
+    metric_cols[4].metric("Profiles", summary["total_profiles"])
+    metric_cols[5].metric("Total DNS Records", summary["total_records"])
+
+    with st.expander("Local DNS prerequisites", expanded=False):
+        st.markdown(
+            """
+            Local DNS only works when **all** of the following are true:
+
+            - MX firmware **19.1+**
+            - **NAT/Routed** deployment mode (not passthrough)
+            - **Non-template** MX network
+            - Local DNS **profile assigned** to the network
+            - **Proxy to Upstream DNS** enabled on at least one subnet/VLAN
+            - No more than **1024** DNS records on the assigned profile (per MX)
+            """
+        )
+
+    mx_networks = logic.fetch_mx_networks_live(org_id)
+    filtered_networks = network_tag_selector(mx_networks, "overview")
+    allowed_ids = {network["id"] for network in filtered_networks}
+
+    rows = [row for row in overview["rows"] if row["network_id"] in allowed_ids]
+    if not rows:
+        st.info("No MX networks match the current filters.")
+        return
+
+    overview_df = pd.DataFrame(
+        [
+            {
+                "Network": row["network_name"],
+                "Tags": row["tags"],
+                "Firmware": row["firmware_display"],
+                "Mode": row["deployment_mode"],
+                "Template Bound": "Yes" if row["is_template_bound"] else "No",
+                "Profile": row["profile_name"] or "—",
+                "DNS Records": row["dns_record_count"],
+                "Subnets (Proxy/Total)": (
+                    f"{row['proxy_subnet_count']}/{row['total_subnet_count']}"
+                ),
+                "Eligibility": row["eligibility"],
+                "Network ID": row["network_id"],
+            }
+            for row in rows
+        ]
+    )
+
+    table_event = st.dataframe(
+        overview_df,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="overview_table",
+    )
+
+    selected_rows = table_event.selection.rows if table_event.selection else []
+    if selected_rows:
+        selected_row = rows[selected_rows[0]]
+        st.markdown(f"#### {selected_row['network_name']}")
+
+        render_eligibility_checks(selected_row["checks"])
+        if not selected_row["local_dns_functional"]:
+            st.warning(
+                "This MX network does not meet all Local DNS prerequisites. "
+                "Configuration may not take effect until the failed checks are resolved."
+            )
+        if not selected_row["record_limit_ok"]:
+            st.error(
+                f"Assigned profile exceeds the per-MX limit of "
+                f"{MAX_LOCAL_DNS_RECORDS_PER_MX} DNS records."
+            )
+
+        st.markdown("##### Subnets / VLANs")
+        st.caption(
+            "Highlighted rows have **Proxy to Upstream DNS** enabled and will use Local DNS."
+        )
+        subnets = selected_row.get("subnets") or []
+        if subnets:
+            subnets_df = pd.DataFrame(
+                [
+                    {
+                        "Subnet / VLAN": subnet["name"],
+                        "CIDR": subnet["subnet"],
+                        "DHCP DNS Setting": subnet["dns_label"],
+                        "Uses Local DNS": (
+                            "Yes" if subnet["proxy_upstream_dns"] else "No"
+                        ),
+                        "DHCP Handling": subnet["dhcp_handling"],
+                    }
+                    for subnet in subnets
+                ]
+            )
+            st.dataframe(
+                style_subnet_dataframe(subnets_df),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("No subnets or VLANs were returned for this network.")
+
+        st.markdown("##### DNS records on assigned profile")
+        if selected_row["profile_name"]:
+            st.caption(
+                f"Profile: {selected_row['profile_name']} ({selected_row['profile_id']})"
+            )
+        records = selected_row.get("records") or []
+        if records:
+            records_df = pd.DataFrame(
+                [
+                    {
+                        "Hostname": record["hostname"],
+                        "Address": record["address"],
+                        "Record ID": record["recordId"],
+                    }
+                    for record in records
+                ]
+            )
+            st.dataframe(records_df, width="stretch", hide_index=True)
+        elif selected_row["status"] == "Configured":
+            st.info("This profile has no DNS records yet.")
+        else:
+            st.warning("This MX network does not have a Local DNS profile assigned.")
+
+
+def render_profiles(logic, org_id):
+    st.subheader("Local DNS Profiles")
+    profiles = logic.list_profiles(org_id)
+
+    if profiles:
+        profile_df = pd.DataFrame(
+            [{"Profile ID": profile["profileId"], "Name": profile["name"]} for profile in profiles]
+        )
+        selection = st.dataframe(
+            profile_df,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key="profiles_table",
+        )
+        selected_rows = selection.selection.rows if selection.selection else []
+        if selected_rows:
+            selected_profiles = [profiles[index] for index in selected_rows]
+            if st.button("Delete selected profile(s)", type="secondary"):
+                labels = ", ".join(profile["name"] for profile in selected_profiles)
+                request_confirmation(
+                    "bulk_delete_profiles",
+                    (
+                        f"Delete {len(selected_profiles)} profile(s): {labels}? "
+                        "Remove related DNS records and network assignments first."
+                    ),
+                    {
+                        "profile_ids": [
+                            profile["profileId"] for profile in selected_profiles
+                        ]
+                    },
+                )
+    else:
+        st.info("No profiles found. Create one below.")
+
+    st.divider()
+    new_profile_name = st.text_input(
+        "New profile name",
+        key="new_prof_name",
+        placeholder="Enter profile name",
+    )
+    if st.button("Create profile", type="primary"):
+        valid, message = validate_profile_name(new_profile_name)
+        if not valid:
+            st.toast(message, icon="⚠️")
+        else:
+            result = logic.create_profile(org_id, new_profile_name)
+            if result and "error" not in result:
+                st.toast(f"Profile '{new_profile_name.strip()}' created.", icon="✅")
+                st.session_state.pop("new_prof_name", None)
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.toast(f"Error: {result.get('error', 'Unknown')}", icon="⚠️")
+
+
+def render_dns_records(logic, org_id):
+    st.subheader("DNS Records")
+    st.caption("Live data — no cache.")
+
+    profiles = logic.list_profiles(org_id)
+    profile_lookup = {profile["profileId"]: profile["name"] for profile in profiles}
+
+    filter_cols = st.columns([2, 2, 2])
+    with filter_cols[0]:
+        hostname_filter = st.text_input(
+            "Filter hostname",
+            key="dns_hostname_filter",
+            placeholder="Contains...",
+        )
+    with filter_cols[1]:
+        profile_filter = st.multiselect(
+            "Filter profile",
+            options=[profile["name"] for profile in profiles],
+            key="dns_profile_filter",
+        )
+    with filter_cols[2]:
+        address_filter = st.text_input(
+            "Filter address",
+            key="dns_address_filter",
+            placeholder="Contains...",
+        )
+
+    records = logic.list_dns_records(org_id)
+    filtered_records = []
+    for record in records:
+        profile_id = (record.get("profile") or {}).get("id")
+        profile_name = profile_lookup.get(profile_id, "Unknown")
+        if profile_filter and profile_name not in profile_filter:
+            continue
+        if hostname_filter and hostname_filter.lower() not in record.get("hostname", "").lower():
+            continue
+        if address_filter and address_filter.lower() not in record.get("address", "").lower():
+            continue
+        filtered_records.append(record)
+
+    if filtered_records:
+        records_df = pd.DataFrame(
+            [
+                {
+                    "Record ID": record["recordId"],
+                    "Hostname": record["hostname"],
+                    "Address": record["address"],
+                    "Profile": profile_lookup.get(
+                        (record.get("profile") or {}).get("id"), "Unknown"
+                    ),
+                }
+                for record in filtered_records
+            ]
+        )
+        selection = st.dataframe(
+            records_df,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key="dns_records_table",
+        )
+        action_cols = st.columns([1, 1])
+        selected_rows = selection.selection.rows if selection.selection else []
+        if selected_rows:
+            selected_records = [filtered_records[index] for index in selected_rows]
+            with action_cols[0]:
+                if st.button("Delete selected record(s)", type="secondary"):
+                    labels = ", ".join(record["hostname"] for record in selected_records)
+                    request_confirmation(
+                        "bulk_delete_records",
+                        f"Delete {len(selected_records)} DNS record(s): {labels}?",
+                        {"record_ids": [record["recordId"] for record in selected_records]},
+                    )
+            with action_cols[1]:
+                export_payload = {
+                    "version": 1,
+                    "records": [
+                        {
+                            "record_id": record["recordId"],
+                            "hostname": record["hostname"],
+                            "address": record["address"],
+                            "profile_id": (record.get("profile") or {}).get("id"),
+                        }
+                        for record in selected_records
+                    ],
+                }
+                st.download_button(
+                    "Export selected as JSON",
+                    data=json.dumps(export_payload, indent=2),
+                    file_name="dns_records_export.json",
+                    mime="application/json",
+                    width="stretch",
+                )
+    else:
+        st.info("No DNS records match the current filters.")
+
+    st.divider()
+    st.markdown("#### Add DNS record")
+    if not profiles:
+        st.warning("Create a profile before adding DNS records.")
+        return
+
+    profile_options = {
+        f"{profile['name']} ({profile['profileId']})": profile["profileId"]
+        for profile in profiles
+    }
+    create_cols = st.columns([2, 2, 2, 1])
+    new_host = create_cols[0].text_input("Hostname", key="new_host", placeholder="hostname.local")
+    new_addr = create_cols[1].text_input("IP address", key="new_addr", placeholder="10.0.0.1")
+    selected_profile = create_cols[2].selectbox(
+        "Profile",
+        options=list(profile_options.keys()),
+        key="new_prof_select",
+    )
+    if create_cols[3].button("Add", type="primary", width="stretch"):
+        host_ok, host_msg = validate_hostname(new_host)
+        ip_ok, ip_msg = validate_ip_address(new_addr)
+        if not host_ok:
+            st.toast(host_msg, icon="⚠️")
+        elif not ip_ok:
+            st.toast(ip_msg, icon="⚠️")
+        else:
+            result = logic.create_dns_record(
+                org_id,
+                profile_options[selected_profile],
+                new_host,
+                new_addr,
+            )
+            if result and "error" not in result:
+                st.toast("DNS record created.", icon="✅")
+                for key in ("new_host", "new_addr"):
+                    st.session_state.pop(key, None)
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.toast(f"Error: {result.get('error', 'Unknown')}", icon="⚠️")
+
+
+def render_assignments(logic, org_id, progress_callback):
+    st.subheader("Network Assignments")
+    st.caption("Assign Local DNS profiles to MX networks individually, by tag, or via JSON import.")
+
+    assigns = logic.list_assignments(org_id)
+    mx_networks = logic.fetch_mx_networks_live(org_id)
+    profiles = logic.list_profiles(org_id)
+
+    net_lookup = {network["id"]: network for network in mx_networks}
+    prof_lookup = {profile["profileId"]: profile["name"] for profile in profiles}
+
+    if assigns:
+        assignment_df = pd.DataFrame(
+            [
+                {
+                    "Assignment ID": assignment["assignmentId"],
+                    "Network": net_lookup.get(
+                        (assignment.get("network") or {}).get("id"), {}
+                    ).get("name", "Unknown"),
+                    "Network ID": (assignment.get("network") or {}).get("id", ""),
+                    "Tags": format_network_tags(
+                        net_lookup.get((assignment.get("network") or {}).get("id"), {})
+                    ),
+                    "Profile": prof_lookup.get(
+                        (assignment.get("profile") or {}).get("id"), "Unknown"
+                    ),
+                    "Profile ID": (assignment.get("profile") or {}).get("id", ""),
+                }
+                for assignment in assigns
+            ]
+        )
+        selection = st.dataframe(
+            assignment_df,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key="assignments_table",
+        )
+        selected_rows = selection.selection.rows if selection.selection else []
+        if selected_rows and st.button("Unassign selected network(s)", type="secondary"):
+            selected_assignments = [assigns[index] for index in selected_rows]
+            labels = ", ".join(
+                net_lookup.get((item.get("network") or {}).get("id"), {}).get("name", "Unknown")
+                for item in selected_assignments
+            )
+            request_confirmation(
+                "bulk_remove_assignments",
+                f"Remove Local DNS assignment from: {labels}?",
+                {
+                    "assignment_ids": [
+                        item["assignmentId"] for item in selected_assignments
+                    ]
+                },
+            )
+    else:
+        st.info("No network assignments found.")
+
+    st.divider()
+    st.markdown("#### Assign profile to MX networks")
+    if not profiles:
+        st.warning("Create a profile before assigning networks.")
+        return
+    if not mx_networks:
+        st.warning("No MX networks found in this organization.")
+        return
+
+    filtered_networks = network_tag_selector(mx_networks, "assign")
+    selected_network_ids = network_multiselect(filtered_networks, "assign")
+    profile_options = {
+        f"{profile['name']} ({profile['profileId']})": profile["profileId"]
+        for profile in profiles
+    }
+    selected_profile = st.selectbox(
+        "Profile to assign",
+        options=list(profile_options.keys()),
+        key="bulk_assign_profile",
+    )
+
+    if st.button("Assign profile to selected network(s)", type="primary"):
+        if not selected_network_ids:
+            st.toast("Select at least one MX network.", icon="⚠️")
+        else:
+            request_confirmation(
+                "bulk_assign",
+                build_assign_confirmation_message(
+                    logic, org_id, selected_network_ids
+                ),
+                {
+                    "network_ids": selected_network_ids,
+                    "profile_id": profile_options[selected_profile],
+                },
+            )
+
+    st.divider()
+    st.markdown("#### JSON import / export")
+    export_cols = st.columns(2)
+    with export_cols[0]:
+        export_profile_key = st.selectbox(
+            "Profile to export",
+            options=list(profile_options.keys()),
+            key="export_profile_select",
+        )
+        if st.button("Build export preview", width="stretch"):
+            export_data = logic.export_profile_config(
+                org_id, profile_options[export_profile_key]
+            )
+            if export_data and "error" in export_data:
+                st.error(export_data["error"])
+            else:
+                st.session_state["export_preview"] = export_data
+        if st.session_state.get("export_preview"):
+            st.download_button(
+                "Download profile JSON",
+                data=json.dumps(st.session_state["export_preview"], indent=2),
+                file_name="mx_local_dns_profile.json",
+                mime="application/json",
+                width="stretch",
+            )
+            st.json(st.session_state["export_preview"])
+
+    with export_cols[1]:
+        uploaded = st.file_uploader(
+            "Import profile JSON",
+            type=["json"],
+            key="import_json_file",
+        )
+        import_networks = network_multiselect(
+            filter_mx_networks(mx_networks),
+            "import",
+        )
+        create_missing = st.checkbox(
+            "Create profile if missing",
+            value=True,
+            key="import_create_missing",
+        )
+        if uploaded is not None:
+            raw_text = uploaded.getvalue().decode("utf-8")
+            config, parse_error = ProjectLogic.parse_config_json(raw_text)
+            if parse_error:
+                st.error(parse_error)
+            else:
+                st.json(config)
+                if st.button("Import configuration", type="primary"):
+                    request_confirmation(
+                        "import_config",
+                        build_import_confirmation_message(
+                            logic, org_id, import_networks
+                        ),
+                        {
+                            "config": config,
+                            "network_ids": import_networks,
+                            "create_missing": create_missing,
+                        },
+                    )
+
 
 def run_web():
-    """Main application entry point. Initializes the Streamlit UI and handles all user interactions."""
-    st.set_page_config(page_title="MX Local DNS Manager", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="MX Local DNS Manager",
+        page_icon=":material/dns:",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    inject_branding()
     logger.info("[bold green]Initialising MX Local DNS Manager Web UI[/]")
-    
-    # Inject custom CSS for branding and styling
-    st.markdown(f"""
-    <style>
-        :root {{
-            --primary-accent: #144a90;
-            --top-bar-bg: #07172B;
-            --white: #FFFFFF;
-            --st-light-grey: rgba(49, 51, 63, 0.6);
-            --gradient: linear-gradient(to right, #007bff, #6610f2, #e83e8c, #fd7e14);
-        }}
-        [data-testid="stIconMaterial"] {{ color: var(--primary-accent) !important; }}
-        [data-testid="stBaseButton-header"] {{ color: var(--white) !important; }}                
-        [data-testid="stMainMenu"] svg {{ fill: var(--white) !important; }}
-        .stAppDeployButton {{ display: none !important; }}
-        header[data-testid="stHeader"] {{ background-color: transparent; }}
-        .top-gradient-bar {{ position: fixed; top: 0; left: 0; width: 100%; height: 4px; background-image: var(--gradient); z-index: 100001; }}
-        .top-bar {{ position: fixed; top: 4px; left: 0; width: 100%; height: 56px; background-color: var(--top-bar-bg); z-index: 100000; display: flex; align-items: center; padding-left: 60px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }}
-        .top-bar-text {{ color: var(--white); font-weight: 600; font-size: 1.1em; }}
-        .block-container {{ padding-top: 6rem; }}
-        
-        /* Table header styling */
-        .table-header {{ font-weight: bold; border-bottom: 2px solid var(--primary-accent); padding-bottom: 5px; margin-bottom: 10px; }}
-        
-        /* Compact input field styling for table cells */
-        div[data-testid="stColumn"] > div > div > div > div > input {{
-            min-height: 0px; padding: 0.25rem 0.5rem;
-        }}
-    </style>
-    <div class="top-gradient-bar"></div>
-    <div class="top-bar"><div class="top-bar-text">MX LOCAL DNS MANAGER</div></div>
-    """, unsafe_allow_html=True)
+
+    if st.session_state.get("confirm_request"):
+        show_confirm_dialog()
 
     try:
         logic = ProjectLogic()
         orgs = logic.get_organizations()
-        org_map = {o['name']: o['id'] for o in orgs}
+        if not orgs:
+            st.error("No organizations available for this API key.")
+            return
+
+        org_map = {org["name"]: org["id"] for org in orgs}
 
         with st.sidebar:
             st.header("1. Scope")
             selected_org_name = st.selectbox("Organization", list(org_map.keys()))
             org_id = org_map[selected_org_name]
-            
+
             st.header("2. Mode")
-            mode = st.radio("Management Mode", ["Profiles", "DNS Records", "Network Assignments"])
+            mode = st.radio(
+                "Management Mode",
+                [
+                    "Overview",
+                    "Profiles",
+                    "DNS Records",
+                    "Network Assignments",
+                ],
+            )
 
             st.divider()
-            if mode == "Profiles":
-                st.info("Manage Local DNS Profiles. Profiles act as containers for DNS records.")
-            elif mode == "DNS Records":
-                st.info("Manage Hostname-to-IP mappings associated with specific Profiles.")
-            elif mode == "Network Assignments":
-                st.info("Link Profiles to specific Networks to enable local resolution.")
+            mode_help = {
+                "Overview": "Live dashboard with Local DNS eligibility, subnet proxy settings, and DNS records.",
+                "Profiles": "Create and delete Local DNS profiles.",
+                "DNS Records": "Manage hostname-to-IP mappings.",
+                "Network Assignments": "Assign profiles to MX networks, including tag-based bulk actions.",
+            }
+            st.info(mode_help[mode])
 
-            refresh_btn = st.button("Refresh", type="primary", width='stretch')
+            if st.button("Refresh", type="primary", width="stretch"):
+                st.cache_data.clear()
+                logger.info(f"UI: Manual refresh triggered for {mode}")
+                st.rerun()
 
-            # About section with system configuration and documentation links
             st.divider()
-            with st.expander("ℹ️ About", expanded=False):
-                st.markdown("### MX Local DNS Manager")
-                st.caption("Centralized management for Local DNS resolution on MX appliances.")
-                st.markdown("**Author:** SandroN")
-                st.markdown("[GitHub Project Repository](https://github.com/SandroNardi/meraki_MX_local_DNS_managment)")
-                
-                st.divider()
-                if st.button("⚙️ System Configuration", width='stretch'):
-                    show_config_modal()
+            render_sidebar_about()
 
-                if ENABLE_FILE_LOGGING:
-                    if st.button("📄 Application Logs", width='stretch'):
-                        show_log_modal()
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("📜 License", width='stretch'):
-                        show_license_modal()
-                with c2:
-                    if st.button("📖 ReadMe", width='stretch'):
-                        show_readme_modal()
-
-        # Progress bar for long-running operations
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         def update_progress(message, current, total):
-            """Update the progress bar and status text."""
-            val = min(current / total, 1.0)
-            progress_bar.progress(val)
+            progress_bar.progress(min(current / total, 1.0))
             status_text.text(f"Processing: {message}")
 
-        if refresh_btn:
-            logger.info(f"UI: Manual refresh triggered for [cyan]{mode}[/]")
+        approved = st.session_state.pop("confirm_approved", None)
+        if approved:
+            with st.spinner("Applying confirmed action..."):
+                result = execute_confirmed_action(
+                    logic,
+                    org_id,
+                    approved,
+                    progress_callback=update_progress,
+                )
+            progress_bar.empty()
+            status_text.empty()
 
-        # Main content area - render based on selected mode
-        if mode == "Profiles":
-            st.subheader("Local DNS Profiles")
-            profiles = logic.list_profiles(org_id)
-            
-            # Table header
-            cols = st.columns([2, 4, 1])
-            cols[0].markdown("<div class='table-header'>Profile ID</div>", unsafe_allow_html=True)
-            cols[1].markdown("<div class='table-header'>Name</div>", unsafe_allow_html=True)
-            cols[2].markdown("<div class='table-header'>Actions</div>", unsafe_allow_html=True)
-
-            # Display existing profiles
-            if profiles:
-                for p in profiles:
-                    r_cols = st.columns([2, 4, 1])
-                    r_cols[0].text(p['profileId'])
-                    r_cols[1].text(p['name'])
-                    if r_cols[2].button("❌", key=f"del_prof_{p['profileId']}", help="Delete Profile", width='stretch'):
-                        res = logic.delete_profile(org_id, p['profileId'])
-                        if not res or "error" not in res:
-                            st.toast("✅ Profile deleted successfully!", icon="🗑️")
-                            time.sleep(1); st.rerun()
-                        else:
-                            st.toast(f"❌ Error: {res['error']}", icon="⚠️")
+            action = approved.get("action")
+            if isinstance(result, dict) and result.get("error"):
+                st.toast(f"Error: {result['error']}", icon="⚠️")
+            elif action in ("bulk_delete_records", "bulk_delete_profiles"):
+                deleted = result.get("deleted", 0)
+                errors = result.get("errors", [])
+                st.toast(f"Deleted {deleted} item(s).", icon="✅")
+                if errors:
+                    st.warning(f"{len(errors)} item(s) could not be deleted.")
+            elif action == "import_config":
+                st.toast(
+                    f"Import complete. Created {result.get('created_records', 0)} record(s), "
+                    f"skipped {result.get('skipped_records', 0)} duplicate(s).",
+                    icon="✅",
+                )
+                if result.get("record_errors"):
+                    st.warning(result["record_errors"])
+                if result.get("assignment_error"):
+                    st.warning(f"Assignment error: {result['assignment_error']}")
             else:
-                st.info("No profiles found. Use the row below to create one.")
+                st.toast("Action completed successfully.", icon="✅")
+            time.sleep(0.5)
+            st.rerun()
 
-            # Inline creation row for new profiles
-            st.markdown("---")
-            i_cols = st.columns([2, 4, 1])
-            i_cols[0].markdown("*(New)*")
-            new_prof_name = i_cols[1].text_input("New Profile Name", label_visibility="collapsed", placeholder="Enter Profile Name", key="new_prof_name")
-            
-            if i_cols[2].button("➕", key="add_prof_btn", help="Create New Profile", width='stretch'):
-                if new_prof_name:
-                    res = logic.create_profile(org_id, new_prof_name)
-                    if res and "error" not in res:
-                        st.toast(f"✅ Profile '{new_prof_name}' created!", icon="🚀")
-                        if "new_prof_name" in st.session_state: del st.session_state["new_prof_name"]
-                        time.sleep(1); st.rerun()
-                    else:
-                        st.toast(f"❌ Error: {res.get('error', 'Unknown')}", icon="⚠️")
-                else:
-                    st.toast("⚠️ Please enter a profile name.", icon="⚠️")
-
-
+        if mode == "Overview":
+            render_overview(logic, org_id, progress_callback=update_progress)
+        elif mode == "Profiles":
+            render_profiles(logic, org_id)
         elif mode == "DNS Records":
-            st.subheader("DNS Records")
-            records = logic.list_dns_records(org_id)
-            profiles = logic.list_profiles(org_id) 
-            
-            # Create lookup map for Profile ID -> Name
-            prof_lookup = {p['profileId']: p['name'] for p in profiles}
-
-            # Table header
-            cols = st.columns([2, 3, 2, 3, 1])
-            cols[0].markdown("<div class='table-header'>Record ID</div>", unsafe_allow_html=True)
-            cols[1].markdown("<div class='table-header'>Hostname</div>", unsafe_allow_html=True)
-            cols[2].markdown("<div class='table-header'>Address</div>", unsafe_allow_html=True)
-            cols[3].markdown("<div class='table-header'>Profile (ID)</div>", unsafe_allow_html=True)
-            cols[4].markdown("<div class='table-header'>Actions</div>", unsafe_allow_html=True)
-
-            # Display existing DNS records
-            if records:
-                for r in records:
-                    r_cols = st.columns([2, 3, 2, 3, 1])
-                    r_cols[0].text(r['recordId'])
-                    r_cols[1].text(r['hostname'])
-                    r_cols[2].text(r['address'])
-                    
-                    # Resolve profile name from ID
-                    pid = r.get('profile', {}).get('id', 'N/A')
-                    pname = prof_lookup.get(pid, "Unknown")
-                    r_cols[3].text(f"{pname} ({pid})")
-
-                    if r_cols[4].button("❌", key=f"del_rec_{r['recordId']}", help="Delete Record", width='stretch'):
-                        res = logic.delete_dns_record(org_id, r['recordId'])
-                        if not res or "error" not in res:
-                            st.toast("✅ DNS Record removed!", icon="🗑️")
-                            time.sleep(1); st.rerun()
-                        else:
-                            st.toast(f"❌ Error: {res['error']}", icon="⚠️")
-            else:
-                st.info("No DNS records found. Use the row below to create one.")
-
-            # Inline creation row for new DNS records
-            st.markdown("---")
-            if profiles:
-                # Map dropdown display format "Name (ID)" to profile ID
-                p_map = {f"{p['name']} ({p['profileId']})": p['profileId'] for p in profiles}
-                
-                i_cols = st.columns([2, 3, 2, 3, 1])
-                i_cols[0].markdown("*(New)*")
-                new_host = i_cols[1].text_input("Host", label_visibility="collapsed", placeholder="Hostname", key="new_host")
-                new_addr = i_cols[2].text_input("IP", label_visibility="collapsed", placeholder="IP Address", key="new_addr")
-                new_prof_select = i_cols[3].selectbox("Profile", options=list(p_map.keys()), label_visibility="collapsed", key="new_prof_select")
-                
-                if i_cols[4].button("➕", key="add_rec_btn", help="Add DNS Record", width='stretch'):
-                    if new_host and new_addr and new_prof_select:
-                        res = logic.create_dns_record(org_id, p_map[new_prof_select], new_host, new_addr)
-                        if res and "error" not in res:
-                            st.toast("✅ DNS Record created!", icon="🌐")
-                            if "new_host" in st.session_state: del st.session_state["new_host"]
-                            if "new_addr" in st.session_state: del st.session_state["new_addr"]
-                            time.sleep(1); st.rerun()
-                        else:
-                            st.toast(f"❌ Error: {res.get('error', 'Unknown')}", icon="⚠️")
-                    else:
-                        st.toast("⚠️ Please fill in all fields.", icon="⚠️")
-            else:
-                st.warning("⚠️ You must create a Profile before adding DNS records.")
-
-
+            render_dns_records(logic, org_id)
         elif mode == "Network Assignments":
-            st.subheader("Network Assignments")
-            update_progress("Enriching Data...", 1, 3)
-            assigns = logic.list_assignments(org_id)
-            nets = logic.get_networks(org_id)
-            profs = logic.list_profiles(org_id)
-            
-            # Create lookup maps for network and profile names
-            net_lookup = {n['id']: n['name'] for n in nets}
-            prof_lookup = {p['profileId']: p['name'] for p in profs}
-            
-            update_progress("Complete", 3, 3)
-            time.sleep(0.3); status_text.empty(); progress_bar.empty()
+            render_assignments(logic, org_id, update_progress)
 
-            # Table header
-            cols = st.columns([2, 3, 3, 1])
-            cols[0].markdown("<div class='table-header'>Assignment ID</div>", unsafe_allow_html=True)
-            cols[1].markdown("<div class='table-header'>Network (ID)</div>", unsafe_allow_html=True)
-            cols[2].markdown("<div class='table-header'>Profile (ID)</div>", unsafe_allow_html=True)
-            cols[3].markdown("<div class='table-header'>Actions</div>", unsafe_allow_html=True)
+        progress_bar.empty()
+        status_text.empty()
 
-            # Display existing assignments
-            if assigns:
-                for a in assigns:
-                    n_id = a.get('network', {}).get('id')
-                    p_id = a.get('profile', {}).get('id')
-                    
-                    # Resolve network and profile names from IDs
-                    n_name = net_lookup.get(n_id, "Unknown")
-                    p_name = prof_lookup.get(p_id, "Unknown")
-                    
-                    n_display = f"{n_name} ({n_id})"
-                    p_display = f"{p_name} ({p_id})"
+    except Exception as exc:
+        logger.error(f"[bold red]Critical App Error: {exc}[/]", exc_info=True)
+        st.error(f"Application Error: {exc}")
 
-                    r_cols = st.columns([2, 3, 3, 1])
-                    r_cols[0].text(a['assignmentId'])
-                    r_cols[1].text(n_display)
-                    r_cols[2].text(p_display)
-                    
-                    if r_cols[3].button("❌", key=f"del_assign_{a['assignmentId']}", help="Remove Assignment", width='stretch'):
-                        res = logic.remove_assignment(org_id, a['assignmentId'])
-                        if not res or "error" not in res:
-                            st.toast("✅ Assignment removed!", icon="🔗")
-                            time.sleep(1); st.rerun()
-                        else:
-                            st.toast(f"❌ Error: {res['error']}", icon="⚠️")
-            else:
-                st.info("No network assignments found. Use the row below to create one.")
-
-            # Inline creation row for new assignments
-            st.markdown("---")
-            if nets and profs:
-                # Map dropdown display format "Name (ID)" to IDs
-                n_map_rev = {f"{n['name']} ({n['id']})": n['id'] for n in nets}
-                p_map_rev = {f"{p['name']} ({p['profileId']})": p['profileId'] for p in profs}
-
-                i_cols = st.columns([2, 3, 3, 1])
-                i_cols[0].markdown("*(New)*")
-                sel_net_name = i_cols[1].selectbox("Net", options=list(n_map_rev.keys()), label_visibility="collapsed", key="new_assign_net")
-                sel_prof_name = i_cols[2].selectbox("Prof", options=list(p_map_rev.keys()), label_visibility="collapsed", key="new_assign_prof")
-                
-                if i_cols[3].button("➕", key="add_assign_btn", help="Create Assignment", width='stretch'):
-                    res = logic.assign_profile(org_id, n_map_rev[sel_net_name], p_map_rev[sel_prof_name])
-                    if res and "error" not in res:
-                        st.toast("✅ Network assigned to profile!", icon="🔗")
-                        if "new_assign_net" in st.session_state: del st.session_state["new_assign_net"]
-                        if "new_assign_prof" in st.session_state: del st.session_state["new_assign_prof"]
-                        time.sleep(1); st.rerun()
-                    else:
-                        st.toast(f"❌ Error: {res.get('error', 'Unknown')}", icon="⚠️")
-            else:
-                st.warning("⚠️ You need both Networks and Profiles to create an assignment.")
-
-    except Exception as e:
-        logger.error(f"[bold red]Critical App Error: {e}[/]", exc_info=True)
-        st.error(f"Application Error: {e}")
 
 if __name__ == "__main__":
     run_web()
